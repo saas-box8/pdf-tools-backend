@@ -1,0 +1,146 @@
+# render.yaml — deploy all 13 backends on Render free plan
+# Push this entire folder to GitHub, then: Render Dashboard → New → Blueprint
+
+services:
+  # ── 1. PDF → JPG (photo.py) ───────────────────────────────────────────────
+  - type: web
+    name: pdf-to-jpg
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn photo:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 2. JPG/PNG → PDF (photo1.py) ──────────────────────────────────────────
+  - type: web
+    name: jpg-to-pdf
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn photo1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 3. PDF → Excel (backend.py) ───────────────────────────────────────────
+  - type: web
+    name: pdf-to-excel
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn backend:app --bind 0.0.0.0:$PORT --workers 2 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 4. Excel → PDF (backend1.py) ──────────────────────────────────────────
+  - type: web
+    name: excel-to-pdf
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn backend1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 5. PDF Form Filler (form.py) ──────────────────────────────────────────
+  - type: web
+    name: pdf-form-filler
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn form:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 6. PDF → Word (server.py) ─────────────────────────────────────────────
+  - type: web
+    name: pdf-to-word
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 7. Word → PDF (server1.py) ────────────────────────────────────────────
+  - type: web
+    name: word-to-pdf
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn server1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 8. Protect PDF (pass.py) ──────────────────────────────────────────────
+  - type: web
+    name: pdf-protect
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn pass:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 9. Unlock PDF (pass1.py) ──────────────────────────────────────────────
+  - type: web
+    name: pdf-unlock
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn pass1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 10. PPT Editor / PDF export (app.py) ──────────────────────────────────
+  - type: web
+    name: ppt-editor
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 11. PPTX → PDF (app1.py) ──────────────────────────────────────────────
+  - type: web
+    name: pptx-to-pdf
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 12. HTML/URL → PDF (web.py) ───────────────────────────────────────────
+  - type: web
+    name: html-to-pdf
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn web:app --bind 0.0.0.0:$PORT --workers 2 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
+
+  # ── 13. PDF → HTML (web1.py) ──────────────────────────────────────────────
+  - type: web
+    name: pdf-to-html
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn web1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+    plan: free
