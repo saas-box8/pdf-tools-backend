@@ -22,10 +22,11 @@ from werkzeug.utils import secure_filename
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn  # FIX: needed for correct XML element detection
 
 # reportlab
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
+from reportlab.lib.units import cm  # FIX: removed invalid 'pt' import (not in reportlab.lib.units)
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors as rl_colors
 from reportlab.platypus import (
@@ -73,6 +74,19 @@ def _pt(val) -> float:
         return 11.0
 
 
+def _has_page_break(para) -> bool:
+    """
+    FIX: detect only true page breaks (<w:br w:type='page'/>), not soft line
+    breaks (<w:br/> or <w:br w:type='textWrapping'/>).  The old string-based
+    search was also matching 'w:lastRenderedPageBreak' which is a hint added
+    by Word's renderer, not an actual break instruction.
+    """
+    for br in para._element.findall(".//" + qn("w:br")):
+        if br.get(qn("w:type")) == "page":
+            return True
+    return False
+
+
 def _build_para_text(para, base_size: float = 11.0) -> str:
     """Build reportlab-compatible XML markup from a docx paragraph."""
     parts: list[str] = []
@@ -117,12 +131,12 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     base_style = ParagraphStyle("base", fontSize=11, leading=14, spaceAfter=4)
 
     for para in doc.paragraphs:
-        # Page break
-        if para._element.xml.find("w:lastRenderedPageBreak") != -1 or (
-            para.runs and any(r._element.xml.find("w:br") != -1 for r in para.runs)
-        ):
+        # FIX: only insert a PageBreak for real page-break instructions,
+        # not for every paragraph that happens to contain a soft line break.
+        if _has_page_break(para):
             story.append(PageBreak())
-            continue
+            # Don't 'continue' — the paragraph may also have text before the break
+            # so fall through and render its text content normally.
 
         raw = _build_para_text(para)
         if not raw.strip():
