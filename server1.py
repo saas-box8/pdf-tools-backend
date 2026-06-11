@@ -25,7 +25,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # reportlab
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import pt, cm
+from reportlab.lib.units import cm
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors as rl_colors
 from reportlab.platypus import (
