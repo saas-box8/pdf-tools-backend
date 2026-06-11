@@ -9,6 +9,7 @@ import io
 import os
 import re
 from pathlib import Path
+from typing import Optional
 from xml.sax.saxutils import escape
 
 from flask import Flask, jsonify, request, send_file
@@ -48,7 +49,6 @@ _ALIGN_MAP = {
     None: TA_LEFT,
 }
 
-# Try to use a real Unicode font first.
 _FONT_REGULAR = "Helvetica"
 _FONT_BOLD = "Helvetica-Bold"
 _FONT_ITALIC = "Helvetica-Oblique"
@@ -101,10 +101,14 @@ def _register_font_candidates() -> None:
 _register_font_candidates()
 
 
-def _hex(rgb: RGBColor | None) -> str | None:
+# FIX 1: Use Optional[] instead of X | Y union syntax — compatible with Python < 3.10
+def _hex(rgb: Optional[RGBColor]) -> Optional[str]:
     if rgb is None:
         return None
-    return "#{:02x}{:02x}{:02x}".format(rgb.red, rgb.green, rgb.blue)
+    try:
+        return "#{:02x}{:02x}{:02x}".format(rgb.red, rgb.green, rgb.blue)
+    except Exception:
+        return None
 
 
 def _pt(val, default: float = 11.0) -> float:
@@ -116,6 +120,16 @@ def _pt(val, default: float = 11.0) -> float:
         return default
 
 
+# FIX 2: Safe font size lookup — guards against para.style.font being None
+def _para_font_size(para, default: float = 11.0) -> float:
+    try:
+        if para.style and para.style.font and para.style.font.size:
+            return _pt(para.style.font.size, default)
+    except Exception:
+        pass
+    return default
+
+
 def _has_page_break(para) -> bool:
     """True only for explicit page-break runs (<w:br w:type='page'/>)."""
     for br in para._element.findall(".//" + qn("w:br")):
@@ -124,7 +138,9 @@ def _has_page_break(para) -> bool:
     return False
 
 
-def _style_for_paragraph(name: str, size: float, leading: float, alignment, bold: bool = False):
+def _style_for_paragraph(
+    name: str, size: float, leading: float, alignment, bold: bool = False
+) -> ParagraphStyle:
     return ParagraphStyle(
         name=name,
         fontName=_FONT_BOLD if bold else _FONT_REGULAR,
@@ -135,21 +151,34 @@ def _style_for_paragraph(name: str, size: float, leading: float, alignment, bold
     )
 
 
+# FIX 3: Safe color extraction — theme colors have no .rgb attribute
+def _run_color(run) -> Optional[str]:
+    try:
+        color = run.font.color
+        if color and color.type is not None:
+            rgb = color.rgb  # raises if theme color
+            return _hex(rgb)
+    except Exception:
+        pass
+    return None
+
+
 def _para_markup(para, base_size: float = 11.0) -> str:
     """Convert a docx paragraph's runs to ReportLab XML markup."""
-    parts: list[str] = []
+    parts: list = []
 
     for run in para.runs:
         text = run.text or ""
         if not text:
             continue
 
-        # Escape XML and preserve line breaks.
         text = escape(text, {'"': "&quot;", "'": "&apos;"})
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
 
         size = _pt(run.font.size, base_size)
-        color = _hex(run.font.color.rgb if (run.font.color and run.font.color.type) else None)
+
+        # FIX 3 applied: use safe helper instead of inline access
+        color = _run_color(run)
 
         font_name = _FONT_REGULAR
         if run.bold and run.italic:
@@ -159,10 +188,12 @@ def _para_markup(para, base_size: float = 11.0) -> str:
         elif run.italic:
             font_name = _FONT_ITALIC
 
-        open_tags = [f'<font name="{font_name}" size="{size:.1f}"']
+        tag = f'<font name="{font_name}" size="{size:.1f}"'
         if color:
-            open_tags[0] += f' color="{color}"'
-        open_tags[0] += ">"
+            tag += f' color="{color}"'
+        tag += ">"
+
+        open_tags = [tag]
         close_tags = ["</font>"]
 
         if run.bold:
@@ -206,7 +237,6 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     base_style = _style_for_paragraph("base", 11, 14, TA_LEFT)
     story: list = []
 
-    # Paragraphs
     for para in doc.paragraphs:
         if _has_page_break(para):
             story.append(PageBreak())
@@ -232,12 +262,12 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
             ps.spaceBefore = 6
             ps.spaceAfter = 4
         else:
-            sz = _pt(para.style.font.size if para.style else None)
+            # FIX 2 applied: safe font size lookup
+            sz = _para_font_size(para)
             ps = _style_for_paragraph("body", sz, sz * 1.3, align)
 
         story.append(_safe_para(markup, ps))
 
-    # Tables
     for table in doc.tables:
         rows = []
         for row in table.rows:
