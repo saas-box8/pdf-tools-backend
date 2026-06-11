@@ -1,17 +1,14 @@
 # ── Word → PDF  (LibreOffice headless — Render free Docker) ───────────────────
 #
-# Key decisions for Render free tier (512 MB RAM, writable build FS):
-#   • Minimal apt packages  → avoids OOM during build
-#   • pip deps in own layer → only reinstalls when requirements.txt changes
-#   • workers=1             → LO alone needs ~250 MB resident; 2 workers = OOM
-#   • timeout=120           → LO cold-start can take 20-40 s (default 30 kills it)
-#   • CMD uses shell form   → $PORT is expanded at runtime (Render sets it to 10000)
-#   • No hardcoded port 5000 → Render's health-check connects on $PORT, not 5000
+# Uses its OWN requirements file (requirements.word-to-pdf.txt) — NOT the
+# shared requirements.txt — to avoid OOM during build. The shared file pulls
+# in opencv, rapidocr, pymupdf etc. which server1.py does not need and which
+# push the 512 MB Render free build over its memory limit.
 
 FROM python:3.11-slim
 
-# Install LibreOffice Writer + minimal fonts
-# fonts-noto-core omitted (large download) — add if you need CJK support
+# Install LibreOffice Writer + minimal fonts.
+# fonts-noto-core omitted (large) — add back if you need CJK character support.
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         libreoffice-writer \
@@ -34,17 +31,18 @@ ENV LANG=en_US.UTF-8 \
 
 WORKDIR /app
 
-# Python deps — cached layer, only rebuilds when requirements.txt changes
-COPY requirements.txt .
+# Only install the 4 packages server1.py actually needs — keeps build fast and
+# well within the 512 MB Render free memory ceiling.
+COPY requirements.word-to-pdf.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.word-to-pdf.txt
 
 # App source
 COPY server1.py .
 
 EXPOSE 10000
 
-# Shell form CMD so $PORT is evaluated at container start (Render sets PORT=10000)
+# Shell-form CMD so $PORT is evaluated at container start (Render sets PORT=10000)
 CMD gunicorn server1:app \
         --bind 0.0.0.0:$PORT \
         --workers 1 \
