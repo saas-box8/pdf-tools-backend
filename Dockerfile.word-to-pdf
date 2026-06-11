@@ -1,10 +1,19 @@
 # ── Word → PDF  (LibreOffice headless on Render free Docker) ──────────────────
-# Render free Docker gives a writable FS during build, so apt-get works fine.
-# The image is cached between deploys — LibreOffice only downloads once.
+# Render free Docker: 512 MB RAM, writable build FS, image cached between deploys.
+# LibreOffice is installed once at build time — subsequent code-only pushes reuse
+# the cached layer and deploy in seconds.
 
 FROM python:3.11-slim
 
-# Install LibreOffice Writer + fonts (no GUI components)
+# ── System deps ───────────────────────────────────────────────────────────────
+# libreoffice-writer    : the conversion engine
+# libreoffice-common    : shared LO runtime
+# fonts-liberation      : Arial / Times / Courier drop-ins (critical for layout accuracy)
+# fonts-dejavu-core     : broad Unicode coverage
+# fonts-noto-core       : CJK + emoji fallback
+# fonts-noto-cjk-core   : full CJK support (large — remove if not needed)
+# libfontconfig1        : font discovery used by LO
+# locales / locales-all : en_US.UTF-8 locale so LO formats numbers/dates correctly
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         libreoffice-writer \
@@ -12,24 +21,43 @@ RUN apt-get update -qq && \
         fonts-liberation \
         fonts-dejavu-core \
         fonts-noto-core \
+        libfontconfig1 \
+        locales \
+    && locale-gen en_US.UTF-8 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+ENV LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    # Force LO headless VCL plugin — no display needed
+    SAL_USE_VCLPLUGIN=svp \
+    DISPLAY="" \
+    LO_TIMEOUT=120
+
 WORKDIR /app
 
-# Install Python deps first (layer cached unless requirements change)
+# ── Python deps (cached layer) ────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy the app
+# ── App source ────────────────────────────────────────────────────────────────
+# Copy only server1.py; other backends run in their own services.
 COPY server1.py .
+# Copy HTML frontend if present (optional)
+COPY wordtopdf.html* ./
 
 ENV PORT=5000
 EXPOSE 5000
 
+# workers=1   → stays within 512 MB RAM (LO resident ~250 MB)
+# timeout=120 → first LO call can take 20-40 s; default 30 kills it
 CMD ["gunicorn", "server1:app", \
      "--bind", "0.0.0.0:5000", \
-     "--workers", "2", \
+     "--workers", "1", \
      "--timeout", "120", \
+     "--keep-alive", "5", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
      "--log-level", "info"]
