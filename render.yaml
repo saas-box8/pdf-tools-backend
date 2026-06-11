@@ -69,14 +69,12 @@ services:
     plan: free
 
   # ── 7. Word → PDF (server1.py) ────────────────────────────────────────────
+  # Uses Docker so LibreOffice can be installed (Python runtime has read-only FS).
+  # Render free Docker: 512 MB RAM, writable build FS, image cached between deploys.
   - type: web
     name: word-to-pdf
-    runtime: python
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn server1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.0"
+    runtime: docker
+    dockerfilePath: ./Dockerfile.word-to-pdf
     plan: free
 
   # ── 8. Protect PDF (pass.py) ──────────────────────────────────────────────

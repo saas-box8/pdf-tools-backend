@@ -1,0 +1,35 @@
+# ── Word → PDF  (LibreOffice headless on Render free Docker) ──────────────────
+# Render free Docker gives a writable FS during build, so apt-get works fine.
+# The image is cached between deploys — LibreOffice only downloads once.
+
+FROM python:3.11-slim
+
+# Install LibreOffice Writer + fonts (no GUI components)
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        libreoffice-writer \
+        libreoffice-common \
+        fonts-liberation \
+        fonts-dejavu-core \
+        fonts-noto-core \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first (layer cached unless requirements change)
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy the app
+COPY server1.py .
+
+ENV PORT=5000
+EXPOSE 5000
+
+CMD ["gunicorn", "server1:app", \
+     "--bind", "0.0.0.0:5000", \
+     "--workers", "2", \
+     "--timeout", "120", \
+     "--log-level", "info"]
