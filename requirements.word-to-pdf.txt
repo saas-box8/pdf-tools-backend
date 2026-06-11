@@ -1,0 +1,7 @@
+# Minimal requirements for server1.py (Word → PDF via LibreOffice)
+# Kept separate so the Docker build doesn't install the full heavy stack
+# (opencv, rapidocr, pymupdf etc.) which causes OOM on Render free tier.
+flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.2.0
+werkzeug>=3.0.0
