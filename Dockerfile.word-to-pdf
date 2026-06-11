@@ -1,26 +1,23 @@
-# ── Word → PDF  (LibreOffice headless on Render free Docker) ──────────────────
-# Render free Docker: 512 MB RAM, writable build FS, image cached between deploys.
-# LibreOffice is installed once at build time — subsequent code-only pushes reuse
-# the cached layer and deploy in seconds.
+# ── Word → PDF  (LibreOffice headless — Render free Docker) ───────────────────
+#
+# Key decisions for Render free tier (512 MB RAM, writable build FS):
+#   • Minimal apt packages  → avoids OOM during build
+#   • pip deps in own layer → only reinstalls when requirements.txt changes
+#   • workers=1             → LO alone needs ~250 MB resident; 2 workers = OOM
+#   • timeout=120           → LO cold-start can take 20-40 s (default 30 kills it)
+#   • CMD uses shell form   → $PORT is expanded at runtime (Render sets it to 10000)
+#   • No hardcoded port 5000 → Render's health-check connects on $PORT, not 5000
 
 FROM python:3.11-slim
 
-# ── System deps ───────────────────────────────────────────────────────────────
-# libreoffice-writer    : the conversion engine
-# libreoffice-common    : shared LO runtime
-# fonts-liberation      : Arial / Times / Courier drop-ins (critical for layout accuracy)
-# fonts-dejavu-core     : broad Unicode coverage
-# fonts-noto-core       : CJK + emoji fallback
-# fonts-noto-cjk-core   : full CJK support (large — remove if not needed)
-# libfontconfig1        : font discovery used by LO
-# locales / locales-all : en_US.UTF-8 locale so LO formats numbers/dates correctly
+# Install LibreOffice Writer + minimal fonts
+# fonts-noto-core omitted (large download) — add if you need CJK support
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         libreoffice-writer \
         libreoffice-common \
         fonts-liberation \
         fonts-dejavu-core \
-        fonts-noto-core \
         libfontconfig1 \
         locales \
     && locale-gen en_US.UTF-8 \
@@ -30,34 +27,29 @@ RUN apt-get update -qq && \
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     PYTHONUNBUFFERED=1 \
-    # Force LO headless VCL plugin — no display needed
     SAL_USE_VCLPLUGIN=svp \
     DISPLAY="" \
-    LO_TIMEOUT=120
+    LO_TIMEOUT=120 \
+    PORT=10000
 
 WORKDIR /app
 
-# ── Python deps (cached layer) ────────────────────────────────────────────────
+# Python deps — cached layer, only rebuilds when requirements.txt changes
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# ── App source ────────────────────────────────────────────────────────────────
-# Copy only server1.py; other backends run in their own services.
+# App source
 COPY server1.py .
-# Copy HTML frontend if present (optional)
-COPY wordtopdf.html* ./
 
-ENV PORT=5000
-EXPOSE 5000
+EXPOSE 10000
 
-# workers=1   → stays within 512 MB RAM (LO resident ~250 MB)
-# timeout=120 → first LO call can take 20-40 s; default 30 kills it
-CMD ["gunicorn", "server1:app", \
-     "--bind", "0.0.0.0:5000", \
-     "--workers", "1", \
-     "--timeout", "120", \
-     "--keep-alive", "5", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "--log-level", "info"]
+# Shell form CMD so $PORT is evaluated at container start (Render sets PORT=10000)
+CMD gunicorn server1:app \
+        --bind 0.0.0.0:$PORT \
+        --workers 1 \
+        --timeout 120 \
+        --keep-alive 5 \
+        --access-logfile - \
+        --error-logfile - \
+        --log-level info
