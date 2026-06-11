@@ -72,7 +72,17 @@ services:
   - type: web
     name: word-to-pdf
     runtime: python
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # LibreOffice is installed at build time for pixel-perfect DOCX/DOC/ODT/RTF conversion.
+    # The ~250 MB install is cached by Render between deploys.
+    buildCommand: >-
+      apt-get update -qq &&
+      apt-get install -y --no-install-recommends
+        libreoffice-writer
+        libreoffice-common
+        fonts-liberation
+        fonts-dejavu-core &&
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
     startCommand: gunicorn server1:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION

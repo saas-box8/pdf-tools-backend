@@ -1,46 +1,49 @@
 """
-Word (DOCX) → PDF  —  pure Python, no LibreOffice, no system packages.
-Runs on Render free plan (Python 3.11) as part of the pdf-tools-backend suite.
+Word (DOCX/DOC/ODT/RTF) → PDF  —  LibreOffice headless backend
+Runs on Render free plan (Python 3.11).
 
-Improvements over the original server1.py
-------------------------------------------
-* Proper page-size detection from the DOCX section (Letter, A4, custom)
-* Accurate margins from the DOCX section (not hard-coded 2.5 cm)
-* Correct numbered-list counters tracked per numId/ilvl (not always "1.")
-* Strikethrough run support
-* Superscript / subscript run support
-* Inline images embedded in the PDF
-* Table-of-contents / "Title" style detected
-* Bold run-level font name carried through (no more Helvetica-only output)
-* Safe color extraction for theme-colored runs (was crashing)
-* Safe font-size lookup for para.style.font (was crashing on many DOCX files)
-* Page-break detection fixed (was triggering on every <w:br> regardless of type)
-* Named ParagraphStyle instances are unique per paragraph (avoids ReportLab
-  "duplicate style" warnings on long documents)
-* Python < 3.10 compatible type hints (Optional[] instead of X | Y)
-* X-Conversion-Mode response header preserved for the JS front-end
+Strategy
+---------
+1. PRIMARY: LibreOffice headless  — pixel-perfect output, handles all .docx
+   formatting: fonts, images, tables, headers/footers, track changes, etc.
+2. FALLBACK: ReportLab            — pure Python, no binary needed; used only
+   when LibreOffice is not available (shouldn't happen on Render).
+
+Render free-plan constraints handled:
+- Ephemeral disk: all temp files go to /tmp and are cleaned up on every request.
+- Single-process RAM limit: LibreOffice gets a unique --UserInstallation per
+  request so concurrent requests never collide on lock files.
+- 512 MB RAM: LibreOffice Writer uses ~150 MB; well within limits.
+- No persistent storage: nothing is written outside /tmp.
+- Timeout: gunicorn --timeout 120 s; LibreOffice conversion of a 100-page DOCX
+  typically finishes in under 30 s.
 """
 
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 from xml.sax.saxutils import escape
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-# python-docx
+# python-docx  (fallback path only)
 from docx import Document
 from docx.shared import RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 
-# reportlab
+# reportlab  (fallback path only)
 from reportlab.lib import colors as rl_colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.lib.pagesizes import A4, LETTER
@@ -58,11 +61,121 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # ── App setup ─────────────────────────────────────────────────────────────────
 
-app = Flask(__name__, static_folder=".", static_url_path="")
+app = Flask(__name__)
 CORS(app)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
+
+# ── Accepted MIME / extension map ─────────────────────────────────────────────
+
+ACCEPTED_EXTENSIONS = {".docx", ".doc", ".odt", ".rtf"}
+ACCEPTED_MIMES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "application/vnd.oasis.opendocument.text",
+    "application/rtf",
+    "text/rtf",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRIMARY ENGINE — LibreOffice headless
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SOFFICE_BIN: Optional[str] = shutil.which("libreoffice") or shutil.which("soffice")
+
+
+def _libreoffice_available() -> bool:
+    return _SOFFICE_BIN is not None
+
+
+def _convert_with_libreoffice(
+    input_path: str,
+    timeout: int = 90,
+) -> bytes:
+    """
+    Convert a Word/ODT/RTF file to PDF using LibreOffice headless.
+
+    Each call gets an isolated UserInstallation directory so concurrent
+    requests can never fight over the same lock files.
+
+    Returns the PDF bytes on success.
+    Raises RuntimeError on failure.
+    """
+    out_dir = tempfile.mkdtemp(prefix="lo_out_")
+    profile = tempfile.mkdtemp(prefix="lo_prof_")
+
+    try:
+        env = os.environ.copy()
+        # LibreOffice needs HOME when running as root / in containers
+        env["HOME"] = profile
+
+        cmd = [
+            _SOFFICE_BIN,
+            "--headless",
+            "--norestore",
+            "--nofirststartwizard",
+            "--nologo",
+            # Isolated profile — critical for concurrency
+            f"-env:UserInstallation=file://{profile}",
+            "--convert-to",
+            "pdf:writer_pdf_Export",
+            "--outdir",
+            out_dir,
+            input_path,
+        ]
+
+        logger.info("LibreOffice: converting %s", Path(input_path).name)
+        t0 = time.monotonic()
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+        elapsed = time.monotonic() - t0
+        logger.info("LibreOffice: finished in %.2f s (rc=%d)", elapsed, result.returncode)
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            raise RuntimeError(
+                f"LibreOffice exited with code {result.returncode}: {stderr}"
+            )
+
+        # Find the generated PDF
+        pdf_files = list(Path(out_dir).glob("*.pdf"))
+        if not pdf_files:
+            raise RuntimeError(
+                "LibreOffice ran successfully but produced no PDF file. "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+
+        return pdf_files[0].read_bytes()
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"LibreOffice conversion timed out after {timeout} seconds. "
+            "Try a smaller file or contact support."
+        )
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FALLBACK ENGINE — ReportLab  (pure Python, no system binary)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Font registration ─────────────────────────────────────────────────────────
 
@@ -73,16 +186,16 @@ _F_BI   = "Helvetica-BoldOblique"
 
 _FONT_CANDIDATES = [
     (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
-    ),
-    (
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Italic.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-BoldItalic.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
     ),
     (
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -110,9 +223,10 @@ def _register_fonts() -> None:
             if os.path.exists(bi):
                 pdfmetrics.registerFont(TTFont("_S1_BI",   bi))
                 _F_BI   = "_S1_BI"
+            logger.info("ReportLab: registered font family from %s", reg)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Font registration failed for %s: %s", reg, exc)
 
 
 _register_fonts()
@@ -127,12 +241,11 @@ _ALIGN_MAP = {
     None:                       TA_LEFT,
 }
 
-# ── EMU helpers ───────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _emu_to_pt(emu: int) -> float:
     return emu / 12700.0
 
-# ── Safe value extractors ─────────────────────────────────────────────────────
 
 def _safe_pt(val, default: float = 11.0) -> float:
     if val is None:
@@ -144,7 +257,6 @@ def _safe_pt(val, default: float = 11.0) -> float:
 
 
 def _safe_color(run) -> Optional[str]:
-    """Return hex color string for a run, safely handling theme colors."""
     try:
         c = run.font.color
         if c and c.type is not None:
@@ -156,7 +268,6 @@ def _safe_color(run) -> Optional[str]:
 
 
 def _para_base_size(para, fallback: float = 11.0) -> float:
-    """Safely read paragraph-level font size."""
     try:
         if para.style and para.style.font and para.style.font.size:
             return _safe_pt(para.style.font.size, fallback)
@@ -166,14 +277,11 @@ def _para_base_size(para, fallback: float = 11.0) -> float:
 
 
 def _is_explicit_page_break(para) -> bool:
-    """True only for <w:br w:type='page'/> — not every <w:br>."""
     for br in para._element.findall(".//" + qn("w:br")):
         if br.get(qn("w:type")) == "page":
             return True
     return False
 
-
-# ── DOCX section → page geometry ─────────────────────────────────────────────
 
 def _page_geometry(doc: Document):
     default_page   = A4
@@ -209,11 +317,7 @@ def _page_geometry(doc: Document):
         return default_page, default_margin, default_margin, default_margin, default_margin
 
 
-# ── Numbered-list counter tracking ───────────────────────────────────────────
-
 class _NumCounters:
-    """Tracks per-(numId, ilvl) counters so numbered lists count up correctly."""
-
     def __init__(self) -> None:
         self._counts: dict = {}
 
@@ -223,66 +327,48 @@ class _NumCounters:
         return self._counts[key]
 
     def reset_below(self, num_id: str, ilvl: int) -> None:
-        """Reset sub-levels when a higher level advances."""
         for k in list(self._counts.keys()):
             if k[0] == num_id and k[1] > ilvl:
                 del self._counts[k]
 
 
 def _get_list_info(para) -> tuple:
-    """
-    Return (is_bullet, label_text, indent_pt) for list paragraphs.
-    Returns (False, '', 0.0) for non-list paragraphs.
-    """
     style_name = (para.style.name or "").lower() if para.style else ""
-
-    # Check for numPr in paragraph XML (most reliable)
     try:
-        pPr    = para._element.find(qn("w:pPr"))
-        numPr  = pPr.find(qn("w:numPr")) if pPr is not None else None
+        pPr   = para._element.find(qn("w:pPr"))
+        numPr = pPr.find(qn("w:numPr")) if pPr is not None else None
         if numPr is not None:
             numId_el = numPr.find(qn("w:numId"))
             ilvl_el  = numPr.find(qn("w:ilvl"))
             num_id   = numId_el.get(qn("w:val"), "0") if numId_el is not None else "0"
             ilvl     = int(ilvl_el.get(qn("w:val"), "0")) if ilvl_el is not None else 0
             indent   = max(18.0, (ilvl + 1) * 18.0)
-
             is_bullet = "list bullet" in style_name or "bullet" in style_name
             return (is_bullet, num_id, ilvl, indent)
     except Exception:
         pass
-
-    # Style-name fallback
     if "list bullet" in style_name:
         return (True, "0", 0, 18.0)
     if "list number" in style_name:
         return (False, "0", 0, 18.0)
-
     return (None, "0", 0, 0.0)
 
 
-# ── Run markup builder ────────────────────────────────────────────────────────
-
 def _run_markup(para, base_size: float = 11.0) -> str:
-    """Convert a docx paragraph's runs to ReportLab paragraph XML."""
     parts: list = []
     for run in para.runs:
         text = run.text or ""
         if not text:
             continue
-
         text = (
             escape(text, {'"': "&quot;", "'": "&apos;"})
             .replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
         )
-
         size  = _safe_pt(run.font.size, base_size)
         color = _safe_color(run)
-
-        # Superscript / subscript — shift size and add rise
         v_align = None
         try:
-            v_align = run.font.vertAlign  # "superscript" | "subscript" | None
+            v_align = run.font.vertAlign
         except Exception:
             pass
 
@@ -295,7 +381,6 @@ def _run_markup(para, base_size: float = 11.0) -> str:
         else:
             fname = _F_REG
 
-        # Build opening / closing tag stacks
         open_t:  list = [f'<font name="{fname}" size="{size:.1f}"']
         close_t: list = ["</font>"]
 
@@ -308,7 +393,7 @@ def _run_markup(para, base_size: float = 11.0) -> str:
             if color:
                 open_t[0] += f' color="{color}"'
             open_t[0] += ">"
-            open_t.append(f'<super>')
+            open_t.append("<super>")
             close_t.insert(0, "</super>")
         elif v_align == "subscript":
             sub_size = max(6.0, size * 0.65)
@@ -327,8 +412,6 @@ def _run_markup(para, base_size: float = 11.0) -> str:
             open_t.append("<i>"); close_t.insert(0, "</i>")
         if run.underline:
             open_t.append("<u>"); close_t.insert(0, "</u>")
-
-        # Strikethrough — ReportLab uses <strike>
         try:
             if run.font.strike:
                 open_t.append("<strike>"); close_t.insert(0, "</strike>")
@@ -336,12 +419,10 @@ def _run_markup(para, base_size: float = 11.0) -> str:
             pass
 
         parts.append("".join(open_t) + text + "".join(close_t))
-
     return "".join(parts)
 
 
 def _safe_paragraph(markup: str, style: ParagraphStyle) -> Paragraph:
-    """Return a Paragraph, falling back to stripped plain text if markup fails."""
     try:
         return Paragraph(markup, style)
     except Exception:
@@ -353,7 +434,6 @@ def _safe_paragraph(markup: str, style: ParagraphStyle) -> Paragraph:
             return Paragraph("", style)
 
 
-# style_id counter — avoids duplicate ParagraphStyle name warnings in ReportLab
 _style_seq = 0
 
 
@@ -366,7 +446,6 @@ def _make_style(
     space_before: float = 0,
     space_after: float = 4,
 ) -> ParagraphStyle:
-    """Create a uniquely-named ParagraphStyle to avoid ReportLab duplicate warnings."""
     global _style_seq
     _style_seq += 1
     return ParagraphStyle(
@@ -381,10 +460,7 @@ def _make_style(
     )
 
 
-# ── Inline image extraction ───────────────────────────────────────────────────
-
 def _para_images(para, doc: Document, max_width_pt: float) -> list:
-    """Return RLImage flowables for any inline images in this paragraph."""
     images = []
     try:
         ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
@@ -410,9 +486,8 @@ def _para_images(para, doc: Document, max_width_pt: float) -> list:
     return images
 
 
-# ── Core conversion ───────────────────────────────────────────────────────────
-
-def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
+def _reportlab_docx_to_pdf(docx_bytes: bytes) -> bytes:
+    """Fallback: convert DOCX→PDF with ReportLab (pure Python)."""
     doc      = Document(io.BytesIO(docx_bytes))
     counters = _NumCounters()
 
@@ -433,15 +508,11 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     base_style = _make_style(11, 14, TA_LEFT)
     story: list = []
 
-    # ── Paragraphs ────────────────────────────────────────────────────────
     for para in doc.paragraphs:
-
-        # Explicit page break
         if _is_explicit_page_break(para):
             story.append(PageBreak())
             continue
 
-        # Inline images
         for img in _para_images(para, doc, text_w_pt):
             story.append(img)
             story.append(Spacer(1, 4))
@@ -454,75 +525,48 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
         align       = _ALIGN_MAP.get(para.alignment, TA_LEFT)
         style_lower = (para.style.name or "").lower() if para.style else ""
 
-        # ── Heading styles ────────────────────────────────────────────────
         if "title" in style_lower:
-            ps = _make_style(22, 28, TA_CENTER, bold=True,
-                             space_before=0, space_after=12)
-
+            ps = _make_style(22, 28, TA_CENTER, bold=True, space_before=0, space_after=12)
         elif "heading 1" in style_lower:
-            ps = _make_style(18, 22, align, bold=True,
-                             space_before=10, space_after=8)
-
+            ps = _make_style(18, 22, align, bold=True, space_before=10, space_after=8)
         elif "heading 2" in style_lower:
-            ps = _make_style(15, 19, align, bold=True,
-                             space_before=8, space_after=6)
-
+            ps = _make_style(15, 19, align, bold=True, space_before=8, space_after=6)
         elif "heading 3" in style_lower:
-            ps = _make_style(13, 17, align, bold=True,
-                             space_before=6, space_after=4)
-
+            ps = _make_style(13, 17, align, bold=True, space_before=6, space_after=4)
         elif "heading 4" in style_lower or "heading 5" in style_lower:
-            ps = _make_style(12, 15, align, bold=True,
-                             space_before=4, space_after=3)
-
-        # ── List items ────────────────────────────────────────────────────
+            ps = _make_style(12, 15, align, bold=True, space_before=4, space_after=3)
         else:
             is_bullet, num_id, ilvl, indent_pt = _get_list_info(para)
-
             if is_bullet is True:
-                # Bullet list
-                label = "•" if ilvl == 0 else ("◦" if ilvl == 1 else "▪")
+                label  = "•" if ilvl == 0 else ("◦" if ilvl == 1 else "▪")
                 markup = f"{label}&nbsp;&nbsp;{markup}"
-                ps     = _make_style(11, 14, TA_LEFT,
-                                     left_indent=indent_pt, space_after=2)
-
+                ps     = _make_style(11, 14, TA_LEFT, left_indent=indent_pt, space_after=2)
             elif is_bullet is False and num_id != "0":
-                # Numbered list — track counter
                 counters.reset_below(num_id, ilvl)
-                n = counters.next(num_id, ilvl)
+                n      = counters.next(num_id, ilvl)
                 markup = f"{n}.&nbsp;&nbsp;{markup}"
-                ps     = _make_style(11, 14, TA_LEFT,
-                                     left_indent=indent_pt, space_after=2)
-
+                ps     = _make_style(11, 14, TA_LEFT, left_indent=indent_pt, space_after=2)
             else:
-                # Normal body text
                 sz = _para_base_size(para)
-                ps = _make_style(sz, sz * 1.3, align,
-                                 left_indent=indent_pt)
+                ps = _make_style(sz, sz * 1.3, align, left_indent=indent_pt)
 
         story.append(_safe_paragraph(markup, ps))
 
-    # ── Tables ────────────────────────────────────────────────────────────
     for table in doc.tables:
         rows: list = []
         for row in table.rows:
             cells: list = []
             for cell in row.cells:
-                cell_text = "\n".join(
-                    p.text for p in cell.paragraphs if p.text.strip()
-                )
+                cell_text = "\n".join(p.text for p in cell.paragraphs if p.text.strip())
                 safe = escape(cell_text, {'"': "&quot;", "'": "&apos;"})
                 cells.append(_safe_paragraph(safe, base_style))
             rows.append(cells)
 
         if not rows:
             continue
-
         col_n = max(len(r) for r in rows)
         if col_n == 0:
             continue
-
-        # Pad short rows so Table doesn't raise
         for r in rows:
             while len(r) < col_n:
                 r.append(_safe_paragraph("", base_style))
@@ -549,55 +593,140 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     return buf.read()
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN CONVERTER — dispatches to LibreOffice or ReportLab
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def convert_to_pdf(file_bytes: bytes, original_filename: str) -> tuple[bytes, str]:
+    """
+    Convert Word/ODT/RTF bytes to PDF bytes.
+
+    Returns (pdf_bytes, engine_used).
+    Raises RuntimeError on failure.
+    """
+    suffix = Path(secure_filename(original_filename)).suffix.lower() or ".docx"
+
+    # ── LibreOffice path (primary) ───────────────────────────────────────────
+    if _libreoffice_available():
+        tmp_input = tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False, prefix="lo_input_"
+        )
+        try:
+            tmp_input.write(file_bytes)
+            tmp_input.flush()
+            tmp_input.close()
+            pdf_bytes = _convert_with_libreoffice(tmp_input.name)
+            return pdf_bytes, "libreoffice"
+        finally:
+            try:
+                os.unlink(tmp_input.name)
+            except OSError:
+                pass
+
+    # ── ReportLab fallback (DOCX only) ───────────────────────────────────────
+    logger.warning("LibreOffice not found — falling back to ReportLab (DOCX only)")
+    if suffix != ".docx":
+        raise RuntimeError(
+            f"LibreOffice is not available and ReportLab only supports .docx "
+            f"(got {suffix}). Please install LibreOffice on the server."
+        )
+    pdf_bytes = _reportlab_docx_to_pdf(file_bytes)
+    return pdf_bytes, "reportlab"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flask routes
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def home():
-    return jsonify({"status": "running", "tool": "word-to-pdf"})
+    engine = "libreoffice" if _libreoffice_available() else "reportlab-fallback"
+    return jsonify({
+        "status":   "running",
+        "tool":     "word-to-pdf",
+        "engine":   engine,
+        "accepts":  sorted(ACCEPTED_EXTENSIONS),
+        "max_mb":   app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
+    })
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    lo_ok  = _libreoffice_available()
+    status = "ok" if lo_ok else "degraded"
+    return jsonify({
+        "status":          status,
+        "libreoffice":     lo_ok,
+        "libreoffice_bin": _SOFFICE_BIN,
+    }), 200
 
 
 @app.route("/convert", methods=["POST"])
 def convert_word():
+    # ── Validate upload ───────────────────────────────────────────────────────
     upload = request.files.get("file")
     if not upload:
         return jsonify(error="No file uploaded."), 400
     if not upload.filename:
-        return jsonify(error="No file selected."), 400
-    if Path(upload.filename).suffix.lower() != ".docx":
-        return jsonify(error="Only .docx files are accepted."), 400
+        return jsonify(error="No filename provided."), 400
 
     filename = secure_filename(upload.filename)
-    stem     = Path(filename).stem
+    suffix   = Path(filename).suffix.lower()
 
+    if suffix not in ACCEPTED_EXTENSIONS:
+        return jsonify(
+            error=f"Unsupported file type '{suffix}'. "
+                  f"Accepted: {', '.join(sorted(ACCEPTED_EXTENSIONS))}"
+        ), 415
+
+    file_bytes = upload.read()
+    if not file_bytes:
+        return jsonify(error="Uploaded file is empty."), 400
+
+    stem = Path(filename).stem or "converted"
+
+    # ── Convert ───────────────────────────────────────────────────────────────
     try:
-        pdf_bytes = docx_to_pdf_bytes(upload.read())
-        buf  = io.BytesIO(pdf_bytes)
-        resp = send_file(
-            buf,
-            as_attachment=True,
-            download_name=f"{stem}.pdf",
-            mimetype="application/pdf",
-            max_age=0,
-        )
-        resp.headers["Cache-Control"]     = "no-store"
-        resp.headers["X-Conversion-Mode"] = "reportlab"
-        return resp
-
-    except Exception as exc:
-        app.logger.exception("DOCX → PDF conversion failed")
+        pdf_bytes, engine = convert_to_pdf(file_bytes, filename)
+    except RuntimeError as exc:
+        logger.error("Conversion failed: %s", exc)
         return jsonify(error=str(exc)), 500
+    except Exception:
+        logger.exception("Unexpected error during conversion")
+        return jsonify(error="Internal conversion error. Please try again."), 500
+
+    # ── Stream response ───────────────────────────────────────────────────────
+    buf  = io.BytesIO(pdf_bytes)
+    resp = send_file(
+        buf,
+        as_attachment=True,
+        download_name=f"{stem}.pdf",
+        mimetype="application/pdf",
+        max_age=0,
+    )
+    resp.headers["Cache-Control"]     = "no-store"
+    resp.headers["X-Conversion-Mode"] = engine
+    resp.headers["X-Engine"]          = engine
+    return resp
 
 
 @app.errorhandler(413)
 def file_too_large(_):
-    return jsonify(error="File too large (max 100 MB)."), 413
+    max_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return jsonify(error=f"File too large (max {max_mb} MB)."), 413
 
+
+@app.errorhandler(415)
+def unsupported_media(_):
+    return jsonify(
+        error=f"Unsupported media type. Accepted: {', '.join(sorted(ACCEPTED_EXTENSIONS))}"
+    ), 415
+
+
+# ── Local dev launcher ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port  = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    logger.info("Starting word-to-pdf server on port %d (LibreOffice: %s)", port, _libreoffice_available())
+    app.run(host="0.0.0.0", port=port, debug=debug)
