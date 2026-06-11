@@ -1,18 +1,22 @@
 """
 Word (DOCX) → PDF  —  pure Python, no LibreOffice, no system packages.
-Runs on Render free plan (Python 3.11).
+Runs on Render free plan (Python 3.11) as part of the pdf-tools-backend suite.
 
 Improvements over the original server1.py
 ------------------------------------------
-* Proper page-size detection from the DOCX section (letter, A4, custom)
+* Proper page-size detection from the DOCX section (Letter, A4, custom)
 * Accurate margins from the DOCX section (not hard-coded 2.5 cm)
-* List support: bulleted + numbered paragraphs with indentation
+* Correct numbered-list counters tracked per numId/ilvl (not always "1.")
+* Strikethrough run support
+* Superscript / subscript run support
 * Inline images embedded in the PDF
 * Table-of-contents / "Title" style detected
 * Bold run-level font name carried through (no more Helvetica-only output)
 * Safe color extraction for theme-colored runs (was crashing)
 * Safe font-size lookup for para.style.font (was crashing on many DOCX files)
 * Page-break detection fixed (was triggering on every <w:br> regardless of type)
+* Named ParagraphStyle instances are unique per paragraph (avoids ReportLab
+  "duplicate style" warnings on long documents)
 * Python < 3.10 compatible type hints (Optional[] instead of X | Y)
 * X-Conversion-Mode response header preserved for the JS front-end
 """
@@ -32,7 +36,7 @@ from werkzeug.utils import secure_filename
 
 # python-docx
 from docx import Document
-from docx.shared import RGBColor, Inches, Pt
+from docx.shared import RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 
@@ -41,7 +45,7 @@ from reportlab.lib import colors as rl_colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.lib.pagesizes import A4, LETTER
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import cm, inch
+from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
@@ -58,7 +62,7 @@ from reportlab.platypus import (
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 # ── Font registration ─────────────────────────────────────────────────────────
 
@@ -95,17 +99,17 @@ def _register_fonts() -> None:
         if not os.path.exists(reg):
             continue
         try:
-            pdfmetrics.registerFont(TTFont("_SRV_REG",  reg))
-            _F_REG = "_SRV_REG"
+            pdfmetrics.registerFont(TTFont("_S1_REG",  reg))
+            _F_REG = "_S1_REG"
             if os.path.exists(bold):
-                pdfmetrics.registerFont(TTFont("_SRV_BOLD", bold))
-                _F_BOLD = "_SRV_BOLD"
+                pdfmetrics.registerFont(TTFont("_S1_BOLD", bold))
+                _F_BOLD = "_S1_BOLD"
             if os.path.exists(ital):
-                pdfmetrics.registerFont(TTFont("_SRV_ITAL", ital))
-                _F_ITAL = "_SRV_ITAL"
+                pdfmetrics.registerFont(TTFont("_S1_ITAL", ital))
+                _F_ITAL = "_S1_ITAL"
             if os.path.exists(bi):
-                pdfmetrics.registerFont(TTFont("_SRV_BI",   bi))
-                _F_BI   = "_SRV_BI"
+                pdfmetrics.registerFont(TTFont("_S1_BI",   bi))
+                _F_BI   = "_S1_BI"
             return
         except Exception:
             pass
@@ -125,15 +129,8 @@ _ALIGN_MAP = {
 
 # ── EMU helpers ───────────────────────────────────────────────────────────────
 
-_EMU_PER_INCH = 914400
-
-def _emu_to_inch(emu: int) -> float:
-    return emu / _EMU_PER_INCH
-
-
 def _emu_to_pt(emu: int) -> float:
     return emu / 12700.0
-
 
 # ── Safe value extractors ─────────────────────────────────────────────────────
 
@@ -151,7 +148,7 @@ def _safe_color(run) -> Optional[str]:
     try:
         c = run.font.color
         if c and c.type is not None:
-            rgb: RGBColor = c.rgb   # raises AttributeError on theme colors
+            rgb: RGBColor = c.rgb
             return "#{:02x}{:02x}{:02x}".format(rgb.red, rgb.green, rgb.blue)
     except Exception:
         pass
@@ -159,7 +156,7 @@ def _safe_color(run) -> Optional[str]:
 
 
 def _para_base_size(para, fallback: float = 11.0) -> float:
-    """Safely read paragraph-level font size, guarding against None font."""
+    """Safely read paragraph-level font size."""
     try:
         if para.style and para.style.font and para.style.font.size:
             return _safe_pt(para.style.font.size, fallback)
@@ -179,14 +176,8 @@ def _is_explicit_page_break(para) -> bool:
 # ── DOCX section → page geometry ─────────────────────────────────────────────
 
 def _page_geometry(doc: Document):
-    """
-    Return (pagesize, left_margin, right_margin, top_margin, bottom_margin)
-    in ReportLab points, derived from the first section of the DOCX.
-    Falls back to A4 / 2.5 cm margins if the section XML is missing.
-    """
-    default_page  = A4
+    default_page   = A4
     default_margin = 2.5 * cm
-
     try:
         section = doc.sections[0]
         w_emu = section.page_width
@@ -194,7 +185,6 @@ def _page_geometry(doc: Document):
         if w_emu and h_emu and w_emu > 0 and h_emu > 0:
             w_pt = _emu_to_pt(w_emu)
             h_pt = _emu_to_pt(h_emu)
-            # Snap to standard sizes (within 12 pt tolerance)
             if abs(w_pt - 612) < 12 and abs(h_pt - 792) < 12:
                 pagesize = LETTER
             elif abs(w_pt - 595) < 12 and abs(h_pt - 842) < 12:
@@ -215,43 +205,60 @@ def _page_geometry(doc: Document):
         top    = _m(section.top_margin,    default_margin)
         bottom = _m(section.bottom_margin, default_margin)
         return pagesize, left, right, top, bottom
-
     except Exception:
         return default_page, default_margin, default_margin, default_margin, default_margin
 
 
-# ── List indent helpers ───────────────────────────────────────────────────────
+# ── Numbered-list counter tracking ───────────────────────────────────────────
 
-def _list_indent(para) -> float:
-    """Return left indent in points for a list paragraph, or 0."""
-    try:
-        pf = para.paragraph_format
-        ind = pf.left_indent
-        if ind:
-            return _safe_pt(ind, 0.0)
-    except Exception:
-        pass
-    return 0.0
+class _NumCounters:
+    """Tracks per-(numId, ilvl) counters so numbered lists count up correctly."""
+
+    def __init__(self) -> None:
+        self._counts: dict = {}
+
+    def next(self, num_id: str, ilvl: int) -> int:
+        key = (num_id, ilvl)
+        self._counts[key] = self._counts.get(key, 0) + 1
+        return self._counts[key]
+
+    def reset_below(self, num_id: str, ilvl: int) -> None:
+        """Reset sub-levels when a higher level advances."""
+        for k in list(self._counts.keys()):
+            if k[0] == num_id and k[1] > ilvl:
+                del self._counts[k]
 
 
-def _list_bullet(para) -> str:
+def _get_list_info(para) -> tuple:
     """
-    Return the list label text (bullet char or number string) for a list para,
-    or empty string if this isn't a list item.
+    Return (is_bullet, label_text, indent_pt) for list paragraphs.
+    Returns (False, '', 0.0) for non-list paragraphs.
     """
     style_name = (para.style.name or "").lower() if para.style else ""
+
+    # Check for numPr in paragraph XML (most reliable)
+    try:
+        pPr    = para._element.find(qn("w:pPr"))
+        numPr  = pPr.find(qn("w:numPr")) if pPr is not None else None
+        if numPr is not None:
+            numId_el = numPr.find(qn("w:numId"))
+            ilvl_el  = numPr.find(qn("w:ilvl"))
+            num_id   = numId_el.get(qn("w:val"), "0") if numId_el is not None else "0"
+            ilvl     = int(ilvl_el.get(qn("w:val"), "0")) if ilvl_el is not None else 0
+            indent   = max(18.0, (ilvl + 1) * 18.0)
+
+            is_bullet = "list bullet" in style_name or "bullet" in style_name
+            return (is_bullet, num_id, ilvl, indent)
+    except Exception:
+        pass
+
+    # Style-name fallback
     if "list bullet" in style_name:
-        return "•"
+        return (True, "0", 0, 18.0)
     if "list number" in style_name:
-        # Try to get numId and extract the numbering value
-        try:
-            numPr = para._element.find(qn("w:pPr") + "/" + qn("w:numPr"))
-            if numPr is not None:
-                return "1."   # Simplified: we don't track counters per numId
-        except Exception:
-            pass
-        return "1."
-    return ""
+        return (False, "0", 0, 18.0)
+
+    return (None, "0", 0, 0.0)
 
 
 # ── Run markup builder ────────────────────────────────────────────────────────
@@ -264,7 +271,6 @@ def _run_markup(para, base_size: float = 11.0) -> str:
         if not text:
             continue
 
-        # XML-safe, preserve newlines as <br/>
         text = (
             escape(text, {'"': "&quot;", "'": "&apos;"})
             .replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
@@ -272,6 +278,13 @@ def _run_markup(para, base_size: float = 11.0) -> str:
 
         size  = _safe_pt(run.font.size, base_size)
         color = _safe_color(run)
+
+        # Superscript / subscript — shift size and add rise
+        v_align = None
+        try:
+            v_align = run.font.vertAlign  # "superscript" | "subscript" | None
+        except Exception:
+            pass
 
         if run.bold and run.italic:
             fname = _F_BI
@@ -282,11 +295,31 @@ def _run_markup(para, base_size: float = 11.0) -> str:
         else:
             fname = _F_REG
 
+        # Build opening / closing tag stacks
         open_t:  list = [f'<font name="{fname}" size="{size:.1f}"']
         close_t: list = ["</font>"]
+
         if color:
             open_t[0] += f' color="{color}"'
-        open_t[0] += ">"
+
+        if v_align == "superscript":
+            sup_size = max(6.0, size * 0.65)
+            open_t[0] = f'<font name="{fname}" size="{sup_size:.1f}"'
+            if color:
+                open_t[0] += f' color="{color}"'
+            open_t[0] += ">"
+            open_t.append(f'<super>')
+            close_t.insert(0, "</super>")
+        elif v_align == "subscript":
+            sub_size = max(6.0, size * 0.65)
+            open_t[0] = f'<font name="{fname}" size="{sub_size:.1f}"'
+            if color:
+                open_t[0] += f' color="{color}"'
+            open_t[0] += ">"
+            open_t.append("<sub>")
+            close_t.insert(0, "</sub>")
+        else:
+            open_t[0] += ">"
 
         if run.bold:
             open_t.append("<b>"); close_t.insert(0, "</b>")
@@ -294,6 +327,13 @@ def _run_markup(para, base_size: float = 11.0) -> str:
             open_t.append("<i>"); close_t.insert(0, "</i>")
         if run.underline:
             open_t.append("<u>"); close_t.insert(0, "</u>")
+
+        # Strikethrough — ReportLab uses <strike>
+        try:
+            if run.font.strike:
+                open_t.append("<strike>"); close_t.insert(0, "</strike>")
+        except Exception:
+            pass
 
         parts.append("".join(open_t) + text + "".join(close_t))
 
@@ -313,8 +353,11 @@ def _safe_paragraph(markup: str, style: ParagraphStyle) -> Paragraph:
             return Paragraph("", style)
 
 
+# style_id counter — avoids duplicate ParagraphStyle name warnings in ReportLab
+_style_seq = 0
+
+
 def _make_style(
-    name: str,
     size: float,
     leading: float,
     align: int,
@@ -323,8 +366,11 @@ def _make_style(
     space_before: float = 0,
     space_after: float = 4,
 ) -> ParagraphStyle:
+    """Create a uniquely-named ParagraphStyle to avoid ReportLab duplicate warnings."""
+    global _style_seq
+    _style_seq += 1
     return ParagraphStyle(
-        name=name,
+        name=f"_s1_{_style_seq}",
         fontName=_F_BOLD if bold else _F_REG,
         fontSize=size,
         leading=leading,
@@ -337,25 +383,21 @@ def _make_style(
 
 # ── Inline image extraction ───────────────────────────────────────────────────
 
-def _para_images(para, doc: Document, max_width_pt: float):
-    """
-    Return a list of RLImage flowables for any inline images in this paragraph.
-    Images are scaled to fit within max_width_pt.
-    """
+def _para_images(para, doc: Document, max_width_pt: float) -> list:
+    """Return RLImage flowables for any inline images in this paragraph."""
     images = []
     try:
+        ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
         for run in para.runs:
-            for drawing in run._element.findall(".//" + qn("a:blip"), namespaces={
-                "a": "http://schemas.openxmlformats.org/drawingml/2006/main"
-            }):
-                rId = drawing.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+            for blip in run._element.findall(".//" + qn("a:blip"), namespaces=ns):
+                rId = blip.get(
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+                )
                 if rId and rId in doc.part.rels:
                     img_part = doc.part.rels[rId].target_part
-                    img_bytes = img_part.blob
-                    buf = io.BytesIO(img_bytes)
+                    buf = io.BytesIO(img_part.blob)
                     try:
                         rl_img = RLImage(buf)
-                        # Scale to fit
                         if rl_img.drawWidth > max_width_pt:
                             ratio = max_width_pt / rl_img.drawWidth
                             rl_img.drawWidth  *= ratio
@@ -370,8 +412,9 @@ def _para_images(para, doc: Document, max_width_pt: float):
 
 # ── Core conversion ───────────────────────────────────────────────────────────
 
-def docx_to_pdf_bytes(docx_bytes: bytes, quality: str = "standard") -> bytes:
-    doc = Document(io.BytesIO(docx_bytes))
+def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
+    doc      = Document(io.BytesIO(docx_bytes))
+    counters = _NumCounters()
 
     pagesize, left_m, right_m, top_m, bottom_m = _page_geometry(doc)
     page_w_pt = pagesize[0]
@@ -387,19 +430,20 @@ def docx_to_pdf_bytes(docx_bytes: bytes, quality: str = "standard") -> bytes:
         bottomMargin=bottom_m,
     )
 
-    base_style = _make_style("_base", 11, 14, TA_LEFT)
+    base_style = _make_style(11, 14, TA_LEFT)
     story: list = []
 
     # ── Paragraphs ────────────────────────────────────────────────────────
     for para in doc.paragraphs:
+
         # Explicit page break
         if _is_explicit_page_break(para):
             story.append(PageBreak())
             continue
 
-        # Inline images first
-        for img_flowable in _para_images(para, doc, text_w_pt):
-            story.append(img_flowable)
+        # Inline images
+        for img in _para_images(para, doc, text_w_pt):
+            story.append(img)
             story.append(Spacer(1, 4))
 
         markup = _run_markup(para)
@@ -409,42 +453,52 @@ def docx_to_pdf_bytes(docx_bytes: bytes, quality: str = "standard") -> bytes:
 
         align       = _ALIGN_MAP.get(para.alignment, TA_LEFT)
         style_lower = (para.style.name or "").lower() if para.style else ""
-        indent_pt   = _list_indent(para)
-        bullet      = _list_bullet(para)
 
         # ── Heading styles ────────────────────────────────────────────────
         if "title" in style_lower:
-            ps = _make_style("_title", 22, 28, TA_CENTER, bold=True,
+            ps = _make_style(22, 28, TA_CENTER, bold=True,
                              space_before=0, space_after=12)
 
         elif "heading 1" in style_lower:
-            ps = _make_style("_h1", 18, 22, align, bold=True,
+            ps = _make_style(18, 22, align, bold=True,
                              space_before=10, space_after=8)
 
         elif "heading 2" in style_lower:
-            ps = _make_style("_h2", 15, 19, align, bold=True,
+            ps = _make_style(15, 19, align, bold=True,
                              space_before=8, space_after=6)
 
         elif "heading 3" in style_lower:
-            ps = _make_style("_h3", 13, 17, align, bold=True,
+            ps = _make_style(13, 17, align, bold=True,
                              space_before=6, space_after=4)
 
         elif "heading 4" in style_lower or "heading 5" in style_lower:
-            ps = _make_style("_h4", 12, 15, align, bold=True,
+            ps = _make_style(12, 15, align, bold=True,
                              space_before=4, space_after=3)
 
         # ── List items ────────────────────────────────────────────────────
-        elif bullet:
-            effective_indent = max(indent_pt, 18)
-            markup = f"{bullet}&nbsp;&nbsp;{markup}"
-            ps = _make_style("_list", 11, 14, TA_LEFT,
-                             left_indent=effective_indent, space_after=2)
-
-        # ── Body text ─────────────────────────────────────────────────────
         else:
-            sz = _para_base_size(para)
-            ps = _make_style("_body", sz, sz * 1.3, align,
-                             left_indent=indent_pt)
+            is_bullet, num_id, ilvl, indent_pt = _get_list_info(para)
+
+            if is_bullet is True:
+                # Bullet list
+                label = "•" if ilvl == 0 else ("◦" if ilvl == 1 else "▪")
+                markup = f"{label}&nbsp;&nbsp;{markup}"
+                ps     = _make_style(11, 14, TA_LEFT,
+                                     left_indent=indent_pt, space_after=2)
+
+            elif is_bullet is False and num_id != "0":
+                # Numbered list — track counter
+                counters.reset_below(num_id, ilvl)
+                n = counters.next(num_id, ilvl)
+                markup = f"{n}.&nbsp;&nbsp;{markup}"
+                ps     = _make_style(11, 14, TA_LEFT,
+                                     left_indent=indent_pt, space_after=2)
+
+            else:
+                # Normal body text
+                sz = _para_base_size(para)
+                ps = _make_style(sz, sz * 1.3, align,
+                                 left_indent=indent_pt)
 
         story.append(_safe_paragraph(markup, ps))
 
@@ -452,15 +506,14 @@ def docx_to_pdf_bytes(docx_bytes: bytes, quality: str = "standard") -> bytes:
     for table in doc.tables:
         rows: list = []
         for row in table.rows:
-            cell_paras: list = []
+            cells: list = []
             for cell in row.cells:
-                # Render all paragraphs inside the cell
                 cell_text = "\n".join(
                     p.text for p in cell.paragraphs if p.text.strip()
                 )
-                cell_text_safe = escape(cell_text, {'"': "&quot;", "'": "&apos;"})
-                cell_paras.append(_safe_paragraph(cell_text_safe, base_style))
-            rows.append(cell_paras)
+                safe = escape(cell_text, {'"': "&quot;", "'": "&apos;"})
+                cells.append(_safe_paragraph(safe, base_style))
+            rows.append(cells)
 
         if not rows:
             continue
@@ -468,6 +521,11 @@ def docx_to_pdf_bytes(docx_bytes: bytes, quality: str = "standard") -> bytes:
         col_n = max(len(r) for r in rows)
         if col_n == 0:
             continue
+
+        # Pad short rows so Table doesn't raise
+        for r in rows:
+            while len(r) < col_n:
+                r.append(_safe_paragraph("", base_style))
 
         col_w = text_w_pt / col_n
         tbl = Table(rows, colWidths=[col_w] * col_n)
@@ -507,18 +565,17 @@ def health():
 def convert_word():
     upload = request.files.get("file")
     if not upload:
-        return jsonify(error="No file uploaded"), 400
+        return jsonify(error="No file uploaded."), 400
     if not upload.filename:
-        return jsonify(error="No selected file"), 400
+        return jsonify(error="No file selected."), 400
     if Path(upload.filename).suffix.lower() != ".docx":
         return jsonify(error="Only .docx files are accepted."), 400
 
-    quality  = request.form.get("quality", "standard")
     filename = secure_filename(upload.filename)
     stem     = Path(filename).stem
 
     try:
-        pdf_bytes = docx_to_pdf_bytes(upload.read(), quality=quality)
+        pdf_bytes = docx_to_pdf_bytes(upload.read())
         buf  = io.BytesIO(pdf_bytes)
         resp = send_file(
             buf,
@@ -527,8 +584,8 @@ def convert_word():
             mimetype="application/pdf",
             max_age=0,
         )
-        resp.headers["Cache-Control"]      = "no-store"
-        resp.headers["X-Conversion-Mode"]  = "standard"
+        resp.headers["Cache-Control"]     = "no-store"
+        resp.headers["X-Conversion-Mode"] = "reportlab"
         return resp
 
     except Exception as exc:
@@ -538,7 +595,7 @@ def convert_word():
 
 @app.errorhandler(413)
 def file_too_large(_):
-    return jsonify(error="File too large (max 100 MB)"), 413
+    return jsonify(error="File too large (max 100 MB)."), 413
 
 
 if __name__ == "__main__":
